@@ -11,6 +11,13 @@ namespace protocol {
 constexpr std::size_t kPayloadBytes = 160;
 constexpr std::size_t kHarnessHeaderBytes = 4;
 constexpr std::size_t kHarnessFrameBytes = kHarnessHeaderBytes + kPayloadBytes;
+constexpr std::size_t kDataSymbolCount = 18;
+constexpr std::size_t kCodedSymbolCount = 32;
+constexpr std::size_t kSymbolBytes = 9;
+constexpr std::size_t kCodedSourceBytes = kDataSymbolCount * kSymbolBytes;
+constexpr std::size_t kFragmentHeaderBytes = 1;
+constexpr std::size_t kFragmentBytes = kFragmentHeaderBytes + kSymbolBytes;
+constexpr std::uint32_t kSequenceModulo = 8;
 
 struct HarnessFrame {
     std::uint32_t sequence;
@@ -56,6 +63,45 @@ inline void xor_payload(std::uint8_t* output, const std::uint8_t* left,
     for (std::size_t i = 0; i < kPayloadBytes; ++i) {
         output[i] = static_cast<std::uint8_t>(left[i] ^ right[i]);
     }
+}
+
+inline std::uint8_t gf_multiply(std::uint8_t left, std::uint8_t right) {
+    std::uint16_t a = left;
+    std::uint16_t b = right;
+    std::uint16_t product = 0;
+    while (b != 0U) {
+        if ((b & 1U) != 0U) {
+            product ^= a;
+        }
+        b >>= 1U;
+        a <<= 1U;
+        if ((a & 0x100U) != 0U) {
+            a ^= 0x11dU;
+        }
+    }
+    return static_cast<std::uint8_t>(product);
+}
+
+inline std::uint8_t gf_power(std::uint8_t base, unsigned int exponent) {
+    std::uint8_t result = 1;
+    while (exponent != 0U) {
+        if ((exponent & 1U) != 0U) {
+            result = gf_multiply(result, base);
+        }
+        exponent >>= 1U;
+        base = gf_multiply(base, base);
+    }
+    return result;
+}
+
+inline std::uint8_t gf_inverse(std::uint8_t value) {
+    return gf_power(value, 254U);
+}
+
+inline std::uint8_t generator_coefficient(std::size_t coded_symbol,
+                                          std::size_t data_symbol) {
+    return gf_power(static_cast<std::uint8_t>(coded_symbol + 1U),
+                    static_cast<unsigned int>(data_symbol));
 }
 
 }  // namespace protocol

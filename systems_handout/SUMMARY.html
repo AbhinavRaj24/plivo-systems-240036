@@ -17,13 +17,13 @@
 </head>
 <body>
   <h1>Flaky Network transport design</h1>
-  <p>This submission implements a low-delay UDP transport for 160-byte, 20 ms audio-like frames. The selected visible-profile configuration is <code>--delay_ms 80</code>.</p>
+  <p>This submission implements a low-delay UDP transport for 160-byte, 20 ms audio-like frames. The selected visible-profile configuration is <code>--delay_ms 70</code>.</p>
 
   <h2>Architecture</h2>
   <pre>harness source:47010
         | fixed: sequence + 160-byte payload
         v
-      sender -- DATA / duplicate / XOR --> relay:47001 --> relay:47002 --> receiver
+      sender -- 32 coded fragments --> relay:47001 --> relay:47002 --> receiver
                                                                      |
                                                                      | fixed: sequence + payload
                                                                      v
@@ -31,39 +31,41 @@
   <p>The sender and receiver use only the relay media path. Feedback is not used because a request and its response would both cross the impaired network and the forward path already consumes almost all of the byte budget.</p>
 
   <h2>Wire protocol</h2>
-  <p>Every relay packet is exactly 164 bytes: a four-byte big-endian identifier and a 160-byte payload. DATA uses the original sequence number and can therefore be forwarded without repacking. An XOR packet sets the identifier's high bit; the remaining 31 bits identify the first frame of its protected pair.</p>
+  <p>Every relay packet is exactly 10 bytes: a one-byte header and a nine-byte coded symbol. The header packs a three-bit sequence tag and a five-bit fragment index. The tag is intentionally compact: using the harness-provided <code>T0</code> and <code>DELAY_MS</code>, the receiver maps it to the unique sequence that can still meet its deadline and discards fragments that are already useless.</p>
 
-  <h2>Redundancy strategy</h2>
-  <pre>For each 20-frame block:
-DATA(0)
-DATA(1) + XOR(0,1)
-DATA(2) + DUPLICATE(2)
-...
-DATA(19) + DUPLICATE(19)</pre>
-  <p>Every original DATA packet is transmitted immediately. Frames 2 through 19 receive an immediate second copy, avoiding any FEC-generation delay on 90% of the stream. Frames 0 and 1 share one XOR packet, so the complete block sends 39 packets for 20 input frames while still giving every frame a recovery path.</p>
+  <h2>Erasure coding strategy</h2>
+  <pre>160-byte payload + 2-byte sequence check
+                  ↓
+          eighteen 9-byte symbols
+                  ↓
+        (32,18) Vandermonde code over GF(256)
+                  ↓
+    32 fragments sent immediately; any 18 recover</pre>
+  <p>The sender performs the coding as soon as a frame arrives, so every recovery packet has the same causal start time as the original frame. A Vandermonde generator matrix supplies 32 independently impaired fragments. Any 18 surviving fragments form an invertible matrix and recover all 162 source bytes.</p>
 
   <h2>Receiver behavior</h2>
-  <pre>receive → validate 164-byte packet
-             ↓
-       DATA? ── yes → forward once and retain pair members
-             │
-             no
-             ↓
-       store XOR → recover when exactly one pair member is known</pre>
-  <p>The receiver does not enforce in-order output. The harness scores each sequence against its own deadline, so DATA is forwarded immediately and repeated copies are suppressed. XOR and DATA may arrive in either order, and pair/emission state is bounded.</p>
+  <pre>receive 10-byte fragment
+          ↓
+map compact tag to a still-playable sequence
+          ↓
+collect distinct fragment indexes
+          ↓
+18 available? → invert GF(256) matrix → validate sequence → emit</pre>
+  <p>The receiver stores fragments by sequence and index, tolerating drops, duplicates, delay, and reordering. At 18 fragments it uses Gaussian elimination over GF(256), verifies the encoded sequence check, and immediately emits the reconstructed harness frame. Frame and emission caches are bounded.</p>
 
   <h2>Bandwidth and trade-off</h2>
-  <p>For 20 source frames, the sender transmits 39 packets of 164 bytes: <code>39 × 164 / (20 × 160) = 1.99875x</code>. Skipping redundancy on the first frame before adding the block's XOR also ensures that every partial-stream prefix remains at or below 2.0x. This spends the available bandwidth on proactive, low-latency recovery.</p>
+  <p>Each 160-byte source frame produces 32 packets of 10 bytes: <code>32 × 10 / 160 = 2.0x</code>. There is no feedback traffic. Unlike whole-frame duplication, fragment coding turns independent packet delays into erasures and succeeds whenever any 18 fragments arrive before the frame deadline.</p>
 
   <h2>Measured visible-profile results</h2>
   <table>
     <tr><th>Profile</th><th>Delay</th><th>Seeds tested</th><th>Miss rate range</th><th>Overhead</th></tr>
-    <tr><td>A</td><td>80 ms</td><td>1</td><td>0.13%</td><td>1.99875x</td></tr>
-    <tr><td>B</td><td>80 ms</td><td>1–5</td><td>0.20%–0.87%</td><td>1.99875x</td></tr>
-    <tr><td>B</td><td>75 ms</td><td>1</td><td>3.07% (invalid)</td><td>1.99875x</td></tr>
+    <tr><td>A</td><td>70 ms</td><td>1</td><td>0.00%</td><td>2.00x</td></tr>
+    <tr><td>B</td><td>70 ms</td><td>1–5</td><td>0.00%–0.33%</td><td>2.00x</td></tr>
+    <tr><td>B</td><td>68 ms</td><td>1–5</td><td>0.33%–0.87%</td><td>2.00x</td></tr>
+    <tr><td>B</td><td>65 ms</td><td>1</td><td>3.07% (invalid)</td><td>2.00x</td></tr>
   </table>
 
   <h2>Known limits</h2>
-  <p>Adjacent duplicate packets can both be lost during a burst. The first frame in each XOR pair still has a 20 ms causal recovery penalty because its parity cannot exist until the second frame arrives. Network delay extending past the selected 80 ms deadline will also defeat immediate copies, as demonstrated by the invalid 75 ms profile B experiment.</p>
+  <p>A frame is unrecoverable if fewer than 18 distinct fragments arrive by its deadline; sufficiently long loss bursts or larger hidden delay spikes can cause that. The compact sequence tag is unambiguous at the selected 70 ms delay because the playable window is shorter than the tag's eight-frame cycle. The 68 ms visible runs passed but approached the 1% cap, so 70 ms is selected for hidden-profile margin.</p>
 </body>
 </html>

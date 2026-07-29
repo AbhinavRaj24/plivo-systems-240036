@@ -1,10 +1,9 @@
-// Low-delay UDP sender using immediate duplication plus sparse XOR recovery.
+// Low-delay sender using an immediate (32,18) GF(256) erasure code.
 //
-// The relay wire format is the same 164-byte sequence + payload format used by
-// the harness for DATA. Every frame is sent immediately. In each 20-frame
-// block, 18 frames are duplicated and the first two share one XOR packet. The
-// XOR packet marks its pair-start identifier with the high bit. This protects
-// all frames while keeping byte overhead at or below 1.99875x.
+// Each 160-byte source payload plus its two-byte sequence check is split into
+// eighteen 9-byte symbols. A Vandermonde code produces 32 fragments, any 18
+// of which reconstruct the frame. Each relay datagram is exactly 10 bytes, so
+// 32 fragments consume exactly 2.0x the raw 160-byte stream.
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -18,8 +17,6 @@
 namespace {
 
 constexpr std::size_t kMaxDatagramBytes = 2048;
-constexpr std::uint32_t kRedundancyPeriod = 20;
-constexpr std::uint32_t kParityFlag = std::uint32_t{1} << 31U;
 
 sockaddr_in loopback_address(unsigned short port) {
     sockaddr_in address{};
@@ -45,15 +42,40 @@ int make_bound_socket(unsigned short port) {
     return fd;
 }
 
-bool send_frame(int fd, const sockaddr_in& relay, const std::uint8_t* data,
-                std::size_t size) {
-    const ssize_t sent =
-        sendto(fd, data, size, 0, reinterpret_cast<const sockaddr*>(&relay), sizeof(relay));
-    if (sent < 0) {
-        std::perror("sendto relay");
-        return false;
+void send_encoded_frame(int fd, const sockaddr_in& relay,
+                        const protocol::HarnessFrame& frame) {
+    std::array<std::uint8_t, protocol::kCodedSourceBytes> source{};
+    std::memcpy(source.data(), frame.payload.data(), protocol::kPayloadBytes);
+    source[protocol::kPayloadBytes] =
+        static_cast<std::uint8_t>((frame.sequence >> 8U) & 0xffU);
+    source[protocol::kPayloadBytes + 1U] =
+        static_cast<std::uint8_t>(frame.sequence & 0xffU);
+
+    const std::uint8_t sequence_tag =
+        static_cast<std::uint8_t>(frame.sequence % protocol::kSequenceModulo);
+    for (std::size_t fragment_index = 0;
+         fragment_index < protocol::kCodedSymbolCount; ++fragment_index) {
+        std::array<std::uint8_t, protocol::kFragmentBytes> fragment{};
+        fragment[0] = static_cast<std::uint8_t>(
+            (sequence_tag << 5U) | static_cast<std::uint8_t>(fragment_index));
+
+        for (std::size_t data_symbol = 0;
+             data_symbol < protocol::kDataSymbolCount; ++data_symbol) {
+            const std::uint8_t coefficient =
+                protocol::generator_coefficient(fragment_index, data_symbol);
+            for (std::size_t byte = 0; byte < protocol::kSymbolBytes; ++byte) {
+                fragment[protocol::kFragmentHeaderBytes + byte] ^=
+                    protocol::gf_multiply(
+                        coefficient,
+                        source[data_symbol * protocol::kSymbolBytes + byte]);
+            }
+        }
+
+        if (sendto(fd, fragment.data(), fragment.size(), 0,
+                   reinterpret_cast<const sockaddr*>(&relay), sizeof(relay)) < 0) {
+            std::perror("sendto relay");
+        }
     }
-    return static_cast<std::size_t>(sent) == size;
 }
 
 }  // namespace
@@ -73,9 +95,6 @@ int main() {
 
     const sockaddr_in relay = loopback_address(47001);
     std::uint8_t buffer[kMaxDatagramBytes];
-    std::array<std::uint8_t, protocol::kPayloadBytes> block_first_payload{};
-    std::uint32_t block_first_sequence = 0;
-    bool have_block_first = false;
 
     for (;;) {
         const ssize_t received = recvfrom(input_fd, buffer, sizeof(buffer), 0, nullptr, nullptr);
@@ -89,27 +108,8 @@ int main() {
 
         const auto frame =
             protocol::parse_harness_frame(buffer, static_cast<std::size_t>(received));
-        if (!frame) {
-            continue;
-        }
-
-        send_frame(output_fd, relay, buffer, protocol::kHarnessFrameBytes);
-
-        const std::uint32_t position = frame->sequence % kRedundancyPeriod;
-        if (position == 0U) {
-            block_first_payload = frame->payload;
-            block_first_sequence = frame->sequence;
-            have_block_first = true;
-        } else if (position == 1U && have_block_first &&
-                   block_first_sequence + 1U == frame->sequence) {
-            std::array<std::uint8_t, protocol::kHarnessFrameBytes> parity{};
-            protocol::write_u32_be(parity.data(), kParityFlag | block_first_sequence);
-            protocol::xor_payload(parity.data() + protocol::kHarnessHeaderBytes,
-                                  block_first_payload.data(), frame->payload.data());
-            send_frame(output_fd, relay, parity.data(), parity.size());
-            have_block_first = false;
-        } else {
-            send_frame(output_fd, relay, buffer, protocol::kHarnessFrameBytes);
+        if (frame) {
+            send_encoded_frame(output_fd, relay, *frame);
         }
     }
 

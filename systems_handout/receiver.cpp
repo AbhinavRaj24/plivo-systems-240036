@@ -1,15 +1,17 @@
-// Low-delay UDP receiver for duplicated DATA and sparse XOR recovery packets.
+// Low-delay receiver for the immediate (32,18) GF(256) erasure code.
 //
-// All relay packets are 164 bytes. DATA starts with its ordinary sequence
-// number. XOR packets set the sequence high bit and identify the first two
-// frames of a 20-frame block. Valid DATA and recovered frames are forwarded
-// immediately, while bounded caches suppress duplicates and tolerate reorder.
+// A one-byte fragment header carries a three-bit sequence tag and five-bit
+// fragment index. T0 and DELAY_MS identify the unique still-playable sequence
+// with that tag. Any 18 distinct fragments are inverted to recover the frame.
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <optional>
 #include <sys/socket.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,16 +22,17 @@
 namespace {
 
 constexpr std::size_t kMaxDatagramBytes = 2048;
-constexpr std::size_t kMaxPairRecords = 256;
+constexpr std::size_t kMaxFrameStates = 32;
 constexpr std::size_t kMaxRememberedEmissions = 512;
-constexpr std::uint32_t kRedundancyPeriod = 20;
-constexpr std::uint32_t kParityFlag = std::uint32_t{1} << 31U;
+constexpr double kFrameIntervalMs = 20.0;
+constexpr double kBoundaryToleranceMs = 0.01;
 
-struct PairState {
-    std::array<std::uint8_t, protocol::kPayloadBytes> data[2]{};
-    std::array<std::uint8_t, protocol::kPayloadBytes> parity{};
-    bool have_data[2]{};
-    bool have_parity = false;
+struct FrameState {
+    std::array<std::array<std::uint8_t, protocol::kSymbolBytes>,
+               protocol::kCodedSymbolCount>
+        fragments{};
+    std::array<bool, protocol::kCodedSymbolCount> present{};
+    std::size_t count = 0;
 };
 
 sockaddr_in loopback_address(unsigned short port) {
@@ -56,70 +59,180 @@ int make_bound_socket(unsigned short port) {
     return fd;
 }
 
-class RecoveryBuffer {
-public:
-    RecoveryBuffer(int output_fd, const sockaddr_in& player)
-        : output_fd_(output_fd), player_(player) {}
-
-    void handle_data(std::uint32_t sequence, const std::uint8_t* payload) {
-        const std::uint32_t position = sequence % kRedundancyPeriod;
-        if (position <= 1U) {
-            const std::uint32_t pair_start = sequence - position;
-            PairState& state = state_for(pair_start);
-            const std::size_t slot = static_cast<std::size_t>(position);
-            if (!state.have_data[slot]) {
-                std::memcpy(state.data[slot].data(), payload, protocol::kPayloadBytes);
-                state.have_data[slot] = true;
-            }
-        }
-
-        emit_once(sequence, payload);
-        if (position <= 1U) {
-            const std::uint32_t pair_start = sequence - position;
-            recover_if_possible(pair_start);
-            remove_if_complete(pair_start);
-        }
+double environment_number(const char* name) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) {
+        std::fprintf(stderr, "%s is required\n", name);
+        std::exit(EXIT_FAILURE);
     }
+    char* end = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(value)) {
+        std::fprintf(stderr, "%s is invalid\n", name);
+        std::exit(EXIT_FAILURE);
+    }
+    return value;
+}
 
-    void handle_parity(std::uint32_t pair_start, const std::uint8_t* payload) {
-        if (pair_start % kRedundancyPeriod != 0U ||
-            (was_emitted(pair_start) && was_emitted(pair_start + 1U))) {
+double epoch_seconds() {
+    return std::chrono::duration<double>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+class Decoder {
+public:
+    Decoder(int output_fd, const sockaddr_in& player, double t0, double delay_ms)
+        : output_fd_(output_fd), player_(player), t0_(t0), delay_ms_(delay_ms) {}
+
+    void handle_fragment(const std::uint8_t* packet) {
+        const std::uint8_t sequence_tag = packet[0] >> 5U;
+        const std::size_t fragment_index = packet[0] & 0x1fU;
+        const auto sequence = playable_sequence(sequence_tag);
+        if (!sequence || was_emitted(*sequence)) {
             return;
         }
 
-        PairState& state = state_for(pair_start);
-        if (!state.have_parity) {
-            std::memcpy(state.parity.data(), payload, protocol::kPayloadBytes);
-            state.have_parity = true;
+        FrameState& state = state_for(*sequence);
+        if (state.present[fragment_index]) {
+            return;
         }
-        recover_if_possible(pair_start);
-        remove_if_complete(pair_start);
+        std::memcpy(state.fragments[fragment_index].data(),
+                    packet + protocol::kFragmentHeaderBytes,
+                    protocol::kSymbolBytes);
+        state.present[fragment_index] = true;
+        ++state.count;
+
+        if (state.count >= protocol::kDataSymbolCount) {
+            decode_and_emit(*sequence, state);
+            frames_.erase(*sequence);
+        }
     }
 
 private:
-    PairState& state_for(std::uint32_t pair_start) {
-        const auto [it, inserted] = pairs_.try_emplace(pair_start);
+    std::optional<std::uint32_t> playable_sequence(std::uint8_t sequence_tag) const {
+        const double elapsed_ms = (epoch_seconds() - t0_) * 1000.0;
+        const long long earliest = std::max<long long>(
+            0, static_cast<long long>(std::ceil(
+                   (elapsed_ms - delay_ms_ - kBoundaryToleranceMs) /
+                   kFrameIntervalMs)));
+        const long long latest = static_cast<long long>(
+            std::floor((elapsed_ms + kBoundaryToleranceMs) / kFrameIntervalMs));
+
+        std::optional<std::uint32_t> match;
+        for (long long candidate = earliest; candidate <= latest; ++candidate) {
+            if (candidate >= 0 &&
+                static_cast<std::uint32_t>(candidate) %
+                        protocol::kSequenceModulo ==
+                    sequence_tag) {
+                if (match) {
+                    return std::nullopt;
+                }
+                match = static_cast<std::uint32_t>(candidate);
+            }
+        }
+        return match;
+    }
+
+    FrameState& state_for(std::uint32_t sequence) {
+        const auto [it, inserted] = frames_.try_emplace(sequence);
         if (inserted) {
-            pair_order_.push_back(pair_start);
+            frame_order_.push_back(sequence);
         }
-        while (pairs_.size() > kMaxPairRecords && !pair_order_.empty()) {
-            const std::uint32_t oldest = pair_order_.front();
-            pair_order_.pop_front();
-            pairs_.erase(oldest);
+        while (frames_.size() > kMaxFrameStates && !frame_order_.empty()) {
+            frames_.erase(frame_order_.front());
+            frame_order_.pop_front();
         }
-        return pairs_.at(pair_start);
+        return frames_.at(sequence);
     }
 
     bool was_emitted(std::uint32_t sequence) const {
         return emitted_.find(sequence) != emitted_.end();
     }
 
-    void emit_once(std::uint32_t sequence, const std::uint8_t* payload) {
-        if (was_emitted(sequence)) {
+    void decode_and_emit(std::uint32_t sequence, const FrameState& state) {
+        std::array<std::size_t, protocol::kDataSymbolCount> selected{};
+        std::size_t selected_count = 0;
+        for (std::size_t fragment = 0;
+             fragment < protocol::kCodedSymbolCount &&
+             selected_count < protocol::kDataSymbolCount;
+             ++fragment) {
+            if (state.present[fragment]) {
+                selected[selected_count++] = fragment;
+            }
+        }
+        if (selected_count != protocol::kDataSymbolCount) {
             return;
         }
 
-        const auto frame = protocol::make_harness_frame(sequence, payload);
+        constexpr std::size_t kMatrixWidth = protocol::kDataSymbolCount * 2U;
+        std::array<std::array<std::uint8_t, kMatrixWidth>,
+                   protocol::kDataSymbolCount>
+            matrix{};
+        for (std::size_t row = 0; row < protocol::kDataSymbolCount; ++row) {
+            for (std::size_t column = 0; column < protocol::kDataSymbolCount;
+                 ++column) {
+                matrix[row][column] =
+                    protocol::generator_coefficient(selected[row], column);
+            }
+            matrix[row][protocol::kDataSymbolCount + row] = 1;
+        }
+
+        for (std::size_t column = 0; column < protocol::kDataSymbolCount;
+             ++column) {
+            std::size_t pivot = column;
+            while (pivot < protocol::kDataSymbolCount &&
+                   matrix[pivot][column] == 0U) {
+                ++pivot;
+            }
+            if (pivot == protocol::kDataSymbolCount) {
+                return;
+            }
+            if (pivot != column) {
+                std::swap(matrix[pivot], matrix[column]);
+            }
+
+            const std::uint8_t inverse =
+                protocol::gf_inverse(matrix[column][column]);
+            for (std::size_t entry = 0; entry < kMatrixWidth; ++entry) {
+                matrix[column][entry] =
+                    protocol::gf_multiply(matrix[column][entry], inverse);
+            }
+            for (std::size_t row = 0; row < protocol::kDataSymbolCount; ++row) {
+                if (row == column || matrix[row][column] == 0U) {
+                    continue;
+                }
+                const std::uint8_t factor = matrix[row][column];
+                for (std::size_t entry = 0; entry < kMatrixWidth; ++entry) {
+                    matrix[row][entry] ^= protocol::gf_multiply(
+                        factor, matrix[column][entry]);
+                }
+            }
+        }
+
+        std::array<std::uint8_t, protocol::kCodedSourceBytes> source{};
+        for (std::size_t data_symbol = 0;
+             data_symbol < protocol::kDataSymbolCount; ++data_symbol) {
+            for (std::size_t byte = 0; byte < protocol::kSymbolBytes; ++byte) {
+                std::uint8_t value = 0;
+                for (std::size_t row = 0; row < protocol::kDataSymbolCount;
+                     ++row) {
+                    value ^= protocol::gf_multiply(
+                        matrix[data_symbol][protocol::kDataSymbolCount + row],
+                        state.fragments[selected[row]][byte]);
+                }
+                source[data_symbol * protocol::kSymbolBytes + byte] = value;
+            }
+        }
+
+        const std::uint16_t decoded_sequence =
+            (static_cast<std::uint16_t>(source[protocol::kPayloadBytes]) << 8U) |
+            source[protocol::kPayloadBytes + 1U];
+        if (decoded_sequence != static_cast<std::uint16_t>(sequence)) {
+            return;
+        }
+
+        const auto frame = protocol::make_harness_frame(sequence, source.data());
         if (sendto(output_fd_, frame.data(), frame.size(), 0,
                    reinterpret_cast<const sockaddr*>(&player_), sizeof(player_)) < 0) {
             std::perror("sendto player");
@@ -134,38 +247,12 @@ private:
         }
     }
 
-    void recover_if_possible(std::uint32_t pair_start) {
-        auto it = pairs_.find(pair_start);
-        if (it == pairs_.end()) {
-            return;
-        }
-
-        PairState& state = it->second;
-        const unsigned int data_count = static_cast<unsigned int>(state.have_data[0]) +
-                                        static_cast<unsigned int>(state.have_data[1]);
-        if (!state.have_parity || data_count != 1U) {
-            return;
-        }
-
-        const std::size_t known_slot = state.have_data[0] ? 0U : 1U;
-        const std::size_t missing_slot = 1U - known_slot;
-        protocol::xor_payload(state.data[missing_slot].data(), state.parity.data(),
-                              state.data[known_slot].data());
-        state.have_data[missing_slot] = true;
-        emit_once(pair_start + static_cast<std::uint32_t>(missing_slot),
-                  state.data[missing_slot].data());
-    }
-
-    void remove_if_complete(std::uint32_t pair_start) {
-        if (was_emitted(pair_start) && was_emitted(pair_start + 1U)) {
-            pairs_.erase(pair_start);
-        }
-    }
-
     int output_fd_;
     sockaddr_in player_{};
-    std::unordered_map<std::uint32_t, PairState> pairs_;
-    std::deque<std::uint32_t> pair_order_;
+    double t0_;
+    double delay_ms_;
+    std::unordered_map<std::uint32_t, FrameState> frames_;
+    std::deque<std::uint32_t> frame_order_;
     std::unordered_set<std::uint32_t> emitted_;
     std::deque<std::uint32_t> emission_order_;
 };
@@ -173,6 +260,9 @@ private:
 }  // namespace
 
 int main() {
+    const double t0 = environment_number("T0");
+    const double delay_ms = environment_number("DELAY_MS");
+
     const int input_fd = make_bound_socket(47002);
     if (input_fd < 0) {
         return EXIT_FAILURE;
@@ -187,7 +277,7 @@ int main() {
 
     const sockaddr_in player = loopback_address(47020);
     std::uint8_t buffer[kMaxDatagramBytes];
-    RecoveryBuffer recovery(output_fd, player);
+    Decoder decoder(output_fd, player, t0, delay_ms);
 
     for (;;) {
         const ssize_t received = recvfrom(input_fd, buffer, sizeof(buffer), 0, nullptr, nullptr);
@@ -198,17 +288,8 @@ int main() {
             std::perror("recvfrom relay");
             break;
         }
-
-        if (static_cast<std::size_t>(received) != protocol::kHarnessFrameBytes) {
-            continue;
-        }
-
-        const std::uint32_t wire_id = protocol::read_u32_be(buffer);
-        const std::uint8_t* payload = buffer + protocol::kHarnessHeaderBytes;
-        if ((wire_id & kParityFlag) != 0U) {
-            recovery.handle_parity(wire_id & ~kParityFlag, payload);
-        } else {
-            recovery.handle_data(wire_id, payload);
+        if (static_cast<std::size_t>(received) == protocol::kFragmentBytes) {
+            decoder.handle_fragment(buffer);
         }
     }
 
