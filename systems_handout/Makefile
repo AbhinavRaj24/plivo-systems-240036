@@ -1,13 +1,13 @@
-CC ?= cc
-CFLAGS ?= -O2 -Wall
+CXX ?= c++
+CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic -std=c++17
 
 all: sender receiver
 
-sender: sender.c
-	$(CC) $(CFLAGS) -o sender sender.c
+sender: sender.cpp protocol.hpp
+	$(CXX) $(CXXFLAGS) -o sender sender.cpp
 
-receiver: receiver.c
-	$(CC) $(CFLAGS) -o receiver receiver.c
+receiver: receiver.cpp protocol.hpp
+	$(CXX) $(CXXFLAGS) -o receiver receiver.cpp
 
 clean:
 	rm -f sender receiver
