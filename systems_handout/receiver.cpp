@@ -1,8 +1,9 @@
-// C++ receiver for version-1 DATA and pairwise XOR PARITY packets.
+// Low-delay UDP receiver for duplicated DATA and sparse XOR recovery packets.
 //
-// It stores pieces in bounded pair records, tolerates reordering and duplicates,
-// reconstructs one missing frame from parity, then immediately forwards each
-// frame once in the fixed harness format.
+// All relay packets are 164 bytes. DATA starts with its ordinary sequence
+// number. XOR packets set the sequence high bit and identify the first two
+// frames of a 20-frame block. Valid DATA and recovered frames are forwarded
+// immediately, while bounded caches suppress duplicates and tolerate reorder.
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -21,6 +22,8 @@ namespace {
 constexpr std::size_t kMaxDatagramBytes = 2048;
 constexpr std::size_t kMaxPairRecords = 256;
 constexpr std::size_t kMaxRememberedEmissions = 512;
+constexpr std::uint32_t kRedundancyPeriod = 20;
+constexpr std::uint32_t kParityFlag = std::uint32_t{1} << 31U;
 
 struct PairState {
     std::array<std::uint8_t, protocol::kPayloadBytes> data[2]{};
@@ -59,25 +62,27 @@ public:
         : output_fd_(output_fd), player_(player) {}
 
     void handle_data(std::uint32_t sequence, const std::uint8_t* payload) {
-        if (was_emitted(sequence)) {
-            return;
+        const std::uint32_t position = sequence % kRedundancyPeriod;
+        if (position <= 1U) {
+            const std::uint32_t pair_start = sequence - position;
+            PairState& state = state_for(pair_start);
+            const std::size_t slot = static_cast<std::size_t>(position);
+            if (!state.have_data[slot]) {
+                std::memcpy(state.data[slot].data(), payload, protocol::kPayloadBytes);
+                state.have_data[slot] = true;
+            }
         }
 
-        const std::uint32_t pair_start = sequence & ~std::uint32_t{1};
-        PairState& state = state_for(pair_start);
-        const std::size_t slot = static_cast<std::size_t>(sequence & 1U);
-        if (!state.have_data[slot]) {
-            std::memcpy(state.data[slot].data(), payload, protocol::kPayloadBytes);
-            state.have_data[slot] = true;
+        emit_once(sequence, payload);
+        if (position <= 1U) {
+            const std::uint32_t pair_start = sequence - position;
+            recover_if_possible(pair_start);
+            remove_if_complete(pair_start);
         }
-
-        emit_once(sequence, state.data[slot].data());
-        recover_if_possible(pair_start);
-        remove_if_complete(pair_start);
     }
 
     void handle_parity(std::uint32_t pair_start, const std::uint8_t* payload) {
-        if ((pair_start & 1U) != 0U ||
+        if (pair_start % kRedundancyPeriod != 0U ||
             (was_emitted(pair_start) && was_emitted(pair_start + 1U))) {
             return;
         }
@@ -87,7 +92,6 @@ public:
             std::memcpy(state.parity.data(), payload, protocol::kPayloadBytes);
             state.have_parity = true;
         }
-
         recover_if_possible(pair_start);
         remove_if_complete(pair_start);
     }
@@ -98,26 +102,16 @@ private:
         if (inserted) {
             pair_order_.push_back(pair_start);
         }
-
         while (pairs_.size() > kMaxPairRecords && !pair_order_.empty()) {
-            const std::uint32_t oldest_pair = pair_order_.front();
+            const std::uint32_t oldest = pair_order_.front();
             pair_order_.pop_front();
-            pairs_.erase(oldest_pair);
+            pairs_.erase(oldest);
         }
         return pairs_.at(pair_start);
     }
 
     bool was_emitted(std::uint32_t sequence) const {
         return emitted_.find(sequence) != emitted_.end();
-    }
-
-    void remember_emission(std::uint32_t sequence) {
-        emitted_.insert(sequence);
-        emission_order_.push_back(sequence);
-        while (emission_order_.size() > kMaxRememberedEmissions) {
-            emitted_.erase(emission_order_.front());
-            emission_order_.pop_front();
-        }
     }
 
     void emit_once(std::uint32_t sequence, const std::uint8_t* payload) {
@@ -131,7 +125,13 @@ private:
             std::perror("sendto player");
             return;
         }
-        remember_emission(sequence);
+
+        emitted_.insert(sequence);
+        emission_order_.push_back(sequence);
+        while (emission_order_.size() > kMaxRememberedEmissions) {
+            emitted_.erase(emission_order_.front());
+            emission_order_.pop_front();
+        }
     }
 
     void recover_if_possible(std::uint32_t pair_start) {
@@ -186,7 +186,7 @@ int main() {
     }
 
     const sockaddr_in player = loopback_address(47020);
-    unsigned char buffer[kMaxDatagramBytes];
+    std::uint8_t buffer[kMaxDatagramBytes];
     RecoveryBuffer recovery(output_fd, player);
 
     for (;;) {
@@ -195,20 +195,20 @@ int main() {
             if (errno == EINTR) {
                 continue;
             }
-            std::perror("recvfrom");
+            std::perror("recvfrom relay");
             break;
         }
 
-        const auto packet = protocol::parse_packet(buffer, static_cast<std::size_t>(received));
-        if (!packet || packet->header.scheme != protocol::FecScheme::Xor ||
-            packet->header.group_size != protocol::GroupSizeCode::Two) {
+        if (static_cast<std::size_t>(received) != protocol::kHarnessFrameBytes) {
             continue;
         }
 
-        if (packet->header.type == protocol::PacketType::Data) {
-            recovery.handle_data(packet->header.id, packet->payload);
-        } else if (packet->header.type == protocol::PacketType::Parity) {
-            recovery.handle_parity(packet->header.id, packet->payload);
+        const std::uint32_t wire_id = protocol::read_u32_be(buffer);
+        const std::uint8_t* payload = buffer + protocol::kHarnessHeaderBytes;
+        if ((wire_id & kParityFlag) != 0U) {
+            recovery.handle_parity(wire_id & ~kParityFlag, payload);
+        } else {
+            recovery.handle_data(wire_id, payload);
         }
     }
 

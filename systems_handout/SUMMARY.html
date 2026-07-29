@@ -17,54 +17,53 @@
 </head>
 <body>
   <h1>Flaky Network transport design</h1>
-  <p>This submission implements a small UDP transport for 160-byte, 20 ms audio-like frames. The selected visible-profile configuration is <code>--delay_ms 100</code>.</p>
+  <p>This submission implements a low-delay UDP transport for 160-byte, 20 ms audio-like frames. The selected visible-profile configuration is <code>--delay_ms 80</code>.</p>
 
   <h2>Architecture</h2>
   <pre>harness source:47010
         | fixed: sequence + 160-byte payload
         v
-      sender -- DATA / PARITY packets --> relay:47001 --> relay:47002 --> receiver
+      sender -- DATA / duplicate / XOR --> relay:47001 --> relay:47002 --> receiver
                                                                      |
                                                                      | fixed: sequence + payload
                                                                      v
                                                                harness player:47020</pre>
-  <p>The sender and receiver use only the relay media path. Feedback packet types are reserved by the protocol but are not used in this version.</p>
+  <p>The sender and receiver use only the relay media path. Feedback is not used because a request and its response would both cross the impaired network and the forward path already consumes almost all of the byte budget.</p>
 
   <h2>Wire protocol</h2>
-  <p>Media packets contain a 5-byte header followed by a 160-byte payload. The first byte packs a protocol version, packet type, FEC scheme, and group-size code; the next four bytes are a big-endian sequence number or FEC group start. <code>DATA</code> carries an original payload and <code>PARITY</code> carries XOR parity. The compact header keeps the initial format extensible while keeping bandwidth low.</p>
+  <p>Every relay packet is exactly 164 bytes: a four-byte big-endian identifier and a 160-byte payload. DATA uses the original sequence number and can therefore be forwarded without repacking. An XOR packet sets the identifier's high bit; the remaining 31 bits identify the first frame of its protected pair.</p>
 
-  <h2>Forward error correction</h2>
-  <pre>DATA(0) = frame 0
-DATA(1) = frame 1
-PARITY(0) = frame 0 XOR frame 1
-
-DATA(2) = frame 2
-DATA(3) = frame 3
-PARITY(2) = frame 2 XOR frame 3</pre>
-  <p>Each DATA packet is sent immediately. After the sender receives the odd frame of a pair, it computes and transmits the parity packet. If the receiver has parity and exactly one data member, it XORs the known member with parity to recover the missing original payload.</p>
+  <h2>Redundancy strategy</h2>
+  <pre>For each 20-frame block:
+DATA(0)
+DATA(1) + XOR(0,1)
+DATA(2) + DUPLICATE(2)
+...
+DATA(19) + DUPLICATE(19)</pre>
+  <p>Every original DATA packet is transmitted immediately. Frames 2 through 19 receive an immediate second copy, avoiding any FEC-generation delay on 90% of the stream. Frames 0 and 1 share one XOR packet, so the complete block sends 39 packets for 20 input frames while still giving every frame a recovery path.</p>
 
   <h2>Receiver behavior</h2>
-  <pre>receive → validate → store DATA/PARITY by pair
-                         ↓
-                 recover if one member is missing
-                         ↓
-              forward each available frame once
-                         ↓
-                 remove completed pair state</pre>
-  <p>The receiver does not enforce in-order output. The harness scores each sequence separately against its own deadline, so immediate forwarding avoids needless waiting. The receiver accepts parity before data, data before parity, and duplicates. Its recovery and emitted-frame caches are bounded.</p>
+  <pre>receive → validate 164-byte packet
+             ↓
+       DATA? ── yes → forward once and retain pair members
+             │
+             no
+             ↓
+       store XOR → recover when exactly one pair member is known</pre>
+  <p>The receiver does not enforce in-order output. The harness scores each sequence against its own deadline, so DATA is forwarded immediately and repeated copies are suppressed. XOR and DATA may arrive in either order, and pair/emission state is bounded.</p>
 
   <h2>Bandwidth and trade-off</h2>
-  <p>For two 160-byte source frames, the sender transmits three 165-byte media packets: two DATA plus one PARITY. That is <code>495 / 320 = 1.546875x</code> raw-media bandwidth, reported by the harness as 1.55x. This is below the 2.0x cap and leaves headroom, but this first design deliberately avoids feedback because retransmission adds a relay round trip.</p>
+  <p>For 20 source frames, the sender transmits 39 packets of 164 bytes: <code>39 × 164 / (20 × 160) = 1.99875x</code>. Skipping redundancy on the first frame before adding the block's XOR also ensures that every partial-stream prefix remains at or below 2.0x. This spends the available bandwidth on proactive, low-latency recovery.</p>
 
   <h2>Measured visible-profile results</h2>
   <table>
     <tr><th>Profile</th><th>Delay</th><th>Seeds tested</th><th>Miss rate range</th><th>Overhead</th></tr>
-    <tr><td>A</td><td>100 ms</td><td>1</td><td>0.20%</td><td>1.55x</td></tr>
-    <tr><td>B</td><td>100 ms</td><td>1, 2</td><td>0.73%–0.80%</td><td>1.55x</td></tr>
-    <tr><td>B</td><td>120 ms</td><td>1, 2, 3</td><td>0.47%–0.80%</td><td>1.55x</td></tr>
+    <tr><td>A</td><td>80 ms</td><td>1</td><td>0.13%</td><td>1.99875x</td></tr>
+    <tr><td>B</td><td>80 ms</td><td>1–5</td><td>0.20%–0.87%</td><td>1.99875x</td></tr>
+    <tr><td>B</td><td>75 ms</td><td>1</td><td>3.07% (invalid)</td><td>1.99875x</td></tr>
   </table>
 
   <h2>Known limits</h2>
-  <p>Pairwise XOR repairs one missing member only. Two lost data packets in one pair, or loss of a data packet together with the companion/parity needed to recover it, remains unrecoverable. Extreme jitter can also make causal parity arrive after the earlier frame's deadline.</p>
+  <p>Adjacent duplicate packets can both be lost during a burst. The first frame in each XOR pair still has a 20 ms causal recovery penalty because its parity cannot exist until the second frame arrives. Network delay extending past the selected 80 ms deadline will also defeat immediate copies, as demonstrated by the invalid 75 ms profile B experiment.</p>
 </body>
 </html>
